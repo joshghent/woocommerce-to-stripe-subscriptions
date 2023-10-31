@@ -1,6 +1,5 @@
 require("dotenv").config({ override: true });
 const mysql = require("mysql2/promise");
-const { createTunnel } = require("tunnel-ssh");
 const { Stripe } = require("stripe");
 const fs = require("fs");
 const csv = require("fast-csv");
@@ -17,7 +16,10 @@ const requiredEnvVars = [
   "DRY_RUN",
   "CREATE_CUSTOMER",
   "REMOVE_AND_REDO_SUBSCRIPTIONS",
+  "CREATE_COUPONS",
 ];
+
+let couponsCache = [];
 
 const getDateTimeString = () => {
   const now = new Date();
@@ -157,7 +159,8 @@ async function main() {
         const today = new Date();
         today.setHours(0, 0, 0, 0);
         const next_payment_date = new Date(subscription.next_payment_date);
-        console.log(`Next Billing Date: ${subscription.next_payment_date}`);
+        if (process.env.DEBUG === "true")
+          console.log(`Next Billing Date: ${subscription.next_payment_date}`);
         next_payment_date.setHours(0, 0, 0, 0);
         if (next_payment_date.getTime() === today.getTime()) {
           console.warn(
@@ -165,17 +168,47 @@ async function main() {
           );
         }
 
+        const wooCommerceCoupons = await getCouponsForSubscription(
+          connection,
+          subscription.ID
+        );
+        if (process.env.DEBUG === "true")
+          console.log(
+            `DEBUG: Coupons for subscription ${
+              subscription.ID
+            }: ${JSON.stringify(wooCommerceCoupons)}`
+          );
+        let stripeCouponIds = [];
+        if (
+          process.env.DRY_RUN !== "true" &&
+          process.env.CREATE_COUPONS === "true"
+        ) {
+          stripeCouponIds = await createStripeCoupons(wooCommerceCoupons);
+        } else {
+          console.log(
+            `DRY_RUN: Would create ${wooCommerceCoupons.length} coupons for ${subscription.ID}.`
+          );
+        }
+
         if (
           process.env.DRY_RUN !== "true" &&
           process.env.CREATE_SUBSCRIPTIONS === "true"
         ) {
-          const stripeSubscription = await stripe.subscriptions.create({
+          const subscriptionData = {
             customer: stripeCustomer.id,
             items: stripePriceInfo,
             billing_cycle_anchor: new Date(
               subscription.next_payment_date
             ).getTime(),
-          });
+          };
+
+          if (stripeCouponIds.length > 0) {
+            subscriptionData.coupon = stripeCouponIds[0];
+          }
+
+          const stripeSubscription = await stripe.subscriptions.create(
+            subscriptionData
+          );
 
           console.log(
             `Created Stripe subscription ${stripeSubscription.id} for WooCommerce subscription ${subscription.ID}.`
@@ -186,12 +219,9 @@ async function main() {
               subscription.ID
             }. Details:
             Customer ID: ${stripeCustomer.id},
-            Items: ${JSON.stringify(
-              stripePriceInfo
-            )} - this may be incomplete because the products may not exist,
-            Billing cycle anchor: ${Math.floor(
-              new Date(subscription.next_payment_date).getTime() / 1000
-            )}
+            Items: ${JSON.stringify(stripePriceInfo)},
+            Billing cycle anchor: ${new Date(subscription.next_payment_date)}
+            Coupon: ${stripeCouponIds[0]}
             `
           );
         }
@@ -239,7 +269,8 @@ async function getPriceByProductName(productName) {
     const product = products.data.find((p) => p.name === productName);
 
     if (!product) {
-      console.log(`Product with name ${productName} not found.`);
+      if (process.env.DEBUG === "true")
+        console.log(`Product with name ${productName} not found.`);
       return;
     }
 
@@ -250,17 +281,94 @@ async function getPriceByProductName(productName) {
     });
 
     // Print all the active prices for the product
-    prices.data.forEach((price) => {
-      console.log(
-        `Price ID: ${price.id}, Amount: ${price.unit_amount}, Currency: ${price.currency}`
-      );
-    });
+    if (process.env.DEBUG === "true") {
+      prices.data.forEach((price) => {
+        console.log(
+          `Price ID: ${price.id}, Amount: ${price.unit_amount}, Currency: ${price.currency}`
+        );
+      });
+    }
 
     // Return the list of prices (you can adjust as needed)
     return prices.data;
   } catch (error) {
     console.error("An error occurred:", error);
   }
+}
+
+async function getCouponsForSubscription(connection, subscriptionId) {
+  const query = `
+        SELECT
+    order_items.order_item_name AS coupon_code,
+    discount_meta.meta_value AS coupon_amount,
+    currency_meta.meta_value AS currency
+FROM
+    wp_woocommerce_order_items AS order_items
+-- Join with itemmeta to get coupon amount
+JOIN
+    wp_woocommerce_order_itemmeta AS discount_meta ON order_items.order_item_id = discount_meta.order_item_id AND discount_meta.meta_key = 'discount_amount'
+-- Get the currency of the order
+JOIN
+    wp_postmeta AS currency_meta ON order_items.order_id = currency_meta.post_id AND currency_meta.meta_key = '_order_currency'
+WHERE
+    order_items.order_id = ? AND order_items.order_item_type = 'coupon';
+
+    `;
+
+  const [rows] = await connection.execute(query, [subscriptionId]);
+
+  return rows.map((row) => {
+    return {
+      code: row.coupon_code,
+      amount: row.coupon_amount,
+      currency: row.currency,
+    };
+  });
+}
+
+async function findStripeCouponByCode(code) {
+  if (couponsCache.length === 0) {
+    couponsCache = await stripe.coupons.list();
+  }
+  const coupon = couponsCache.data.find((c) => c.name === code);
+
+  return coupon || null;
+}
+
+async function createStripeCoupons(wooCommerceCoupons) {
+  // You'll need to provide more details about how to map WooCommerce coupon stats to Stripe's
+  // Assuming a basic coupon for a fixed amount:
+
+  const stripeCoupons = [];
+
+  couponsCache = await stripe.coupons.list();
+
+  for (const wooCoupon of wooCommerceCoupons) {
+    const existingCoupon = await findStripeCouponByCode(
+      wooCoupon.name || wooCoupon.code
+    );
+
+    if (existingCoupon) {
+      console.log(
+        `Coupon ${wooCoupon.name || wooCoupon.code} already exists in Stripe.`
+      );
+      stripeCoupons.push(existingCoupon.id);
+      continue;
+    }
+
+    const coupon = await stripe.coupons.create({
+      amount_off: Math.round(wooCoupon.amount * 100), // Convert to cents for Stripe
+      currency: wooCoupon.currency,
+      duration: "forever", // This might be different based on your use case
+      id: wooCoupon.code,
+      name: wooCoupon.name || wooCoupon.code,
+      // ... add other parameters as required
+    });
+
+    stripeCoupons.push(coupon.id);
+  }
+
+  return stripeCoupons;
 }
 
 async function getPriceIdsForSubscription(subscriptionId, connection) {
@@ -276,6 +384,8 @@ async function getPriceIdsForSubscription(subscriptionId, connection) {
   }
 
   const priceIds = [];
+
+  let shippingCreated = false;
 
   for (const product of products) {
     const { priceAmount, currency, productName, shipping } = product;
@@ -297,25 +407,40 @@ async function getPriceIdsForSubscription(subscriptionId, connection) {
       process.env.DRY_RUN !== "true" &&
       process.env.CREATE_PRODUCTS === "true"
     ) {
-      const shippingRate = await stripe.shippingRates.create({
-        name: "Shipping",
-        amount: shipping, // Amount in cents
-        currency: currency,
-      });
       // If the price doesn't exist in Stripe, create one using the product name.
       const newPrice = await stripe.prices.create({
-        unit_amount: priceAmount * 100, // amount in cents
+        unit_amount: Math.round(priceAmount * 100), // amount in cents
         currency: currency,
         recurring: { interval: "year" }, // Subscriptions are always yearly
         product_data: {
           name: productName,
           metadata: {
-            woocommerce_price: priceAmount * 100,
+            woocommerce_price: Math.round(priceAmount * 100),
             woocommerce_currency: currency,
           },
         },
       });
       priceIds.push(newPrice.id);
+
+      // If the product has a shipping rate, create a new price for it.
+      // But only create it once for each subscription
+      if (shipping && shippingCreated === false) {
+        const shippingPrice = await stripe.prices.create({
+          unit_amount: Math.round(shipping * 100), // amount in cents
+          currency: currency,
+          recurring: { interval: "year" }, // Subscriptions are always yearly
+          product_data: {
+            name: `${productName} shipping`,
+            metadata: {
+              woocommerce_price: Math.round(shipping * 100),
+              woocommerce_currency: currency,
+              type: "shipping",
+            },
+          },
+        });
+        priceIds.push(shippingPrice.id);
+        shippingCreated = true;
+      }
     } else {
       console.log(
         `DRY_RUN: Would create a new price for product ${productName}.`

@@ -47,7 +47,42 @@ function validateEnvironmentVariables() {
   }
 }
 
+async function getValidPaymentMethods(customerId) {
+  try {
+    const paymentMethods = await stripe.paymentMethods.list({
+      customer: customerId,
+      type: "card",
+    });
+
+    const currentYear = new Date().getFullYear();
+    const currentMonth = new Date().getMonth() + 1; // JavaScript months are 0-indexed
+
+    const validMethods = paymentMethods.data.filter((method) => {
+      // Check if the card's expiration year is in the future OR
+      // if it's the current year but the expiration month hasn't passed yet
+      return (
+        method.card.exp_year > currentYear ||
+        (method.card.exp_year === currentYear &&
+          method.card.exp_month >= currentMonth)
+      );
+    });
+
+    if (validMethods.length === 0) {
+      console.warn(
+        `No valid payment methods found for customer ${customerId}.`
+      );
+      return null;
+    }
+
+    return validMethods[0].id;
+  } catch (error) {
+    console.error("Error retrieving payment methods:", error);
+    return null;
+  }
+}
+
 let migratedCount = 0;
+let failedCount = 0;
 let stripe = null;
 
 async function main() {
@@ -122,6 +157,13 @@ async function main() {
             console.log(
               `No Stripe customer found for WooCommerce user_id ${subscription.user_id}.`
             );
+            csvRows.push({
+              customer_email: userEmail,
+              stripe_customer_id: null,
+              status: "failed",
+              comment: "No Stripe customer found for WooCommerce user_id",
+            });
+            csvRows.forEach((row) => csvStream.write(row));
             continue;
           }
         }
@@ -141,7 +183,6 @@ async function main() {
             await checkAndRemoveSubscription(stripeCustomer.id);
           } else {
             console.log(`DRY RUN: Would have deleted the users subscription.`);
-            continue;
           }
         }
 
@@ -183,7 +224,10 @@ async function main() {
           process.env.DRY_RUN !== "true" &&
           process.env.CREATE_COUPONS === "true"
         ) {
-          stripeCouponIds = await createStripeCoupons(wooCommerceCoupons);
+          stripeCouponIds = await createStripeCoupons(
+            wooCommerceCoupons,
+            subscription.ID
+          );
         } else {
           console.log(
             `DRY_RUN: Would create ${wooCommerceCoupons.length} coupons for ${subscription.ID}.`
@@ -194,12 +238,27 @@ async function main() {
           process.env.DRY_RUN !== "true" &&
           process.env.CREATE_SUBSCRIPTIONS === "true"
         ) {
+          const paymentMethod = await getValidPaymentMethods(stripeCustomer.id);
+
+          if (!paymentMethod) {
+            csvRows.push({
+              customer_email: userEmail,
+              stripe_customer_id: stripeCustomer.id,
+              status: "failed",
+              comment: "No payment method found for customer",
+            });
+            csvRows.forEach((row) => csvStream.write(row));
+            failedCount++;
+            continue;
+          }
+
           const subscriptionData = {
             customer: stripeCustomer.id,
             items: stripePriceInfo,
-            billing_cycle_anchor: new Date(
-              subscription.next_payment_date
-            ).getTime(),
+            // Convert the next payment date to a Unix timestamp
+            billing_cycle_anchor:
+              new Date(subscription.next_payment_date).getTime() / 1000,
+            default_payment_method: paymentMethod,
           };
 
           if (stripeCouponIds.length > 0) {
@@ -232,6 +291,7 @@ async function main() {
         csvRows.push({
           customer_email: userEmail,
           stripe_customer_id: stripeCustomer.id,
+          status: "success",
         });
         csvRows.forEach((row) => csvStream.write(row));
       } catch (dbError) {
@@ -335,7 +395,7 @@ async function findStripeCouponByCode(code) {
   return coupon || null;
 }
 
-async function createStripeCoupons(wooCommerceCoupons) {
+async function createStripeCoupons(wooCommerceCoupons, subscriptionID) {
   // You'll need to provide more details about how to map WooCommerce coupon stats to Stripe's
   // Assuming a basic coupon for a fixed amount:
 
@@ -350,7 +410,9 @@ async function createStripeCoupons(wooCommerceCoupons) {
 
     if (existingCoupon) {
       console.log(
-        `Coupon ${wooCoupon.name || wooCoupon.code} already exists in Stripe.`
+        `Coupon '${
+          wooCoupon.name || wooCoupon.code
+        }-${subscriptionID}' already exists in Stripe.`
       );
       stripeCoupons.push(existingCoupon.id);
       continue;
@@ -360,8 +422,8 @@ async function createStripeCoupons(wooCommerceCoupons) {
       amount_off: Math.round(wooCoupon.amount * 100), // Convert to cents for Stripe
       currency: wooCoupon.currency,
       duration: "forever", // This might be different based on your use case
-      id: wooCoupon.code,
-      name: wooCoupon.name || wooCoupon.code,
+      id: `${wooCoupon.code}-${subscriptionID}`,
+      name: `${wooCoupon.name || wooCoupon.code}-${subscriptionID}`,
       // ... add other parameters as required
     });
 

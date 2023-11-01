@@ -168,6 +168,21 @@ async function main() {
           }
         }
 
+        // Skip customers with no payment method early on
+        const paymentMethod = await getValidPaymentMethods(stripeCustomer.id);
+
+        if (!paymentMethod) {
+          csvRows.push({
+            customer_email: userEmail,
+            stripe_customer_id: stripeCustomer.id,
+            status: "failed",
+            comment: "No payment method found for customer",
+          });
+          csvRows.forEach((row) => csvStream.write(row));
+          failedCount++;
+          continue;
+        }
+
         const alreadyHasSubscription = await hasActiveStripeSubscription(
           stripeCustomer.id
         );
@@ -238,20 +253,6 @@ async function main() {
           process.env.DRY_RUN !== "true" &&
           process.env.CREATE_SUBSCRIPTIONS === "true"
         ) {
-          const paymentMethod = await getValidPaymentMethods(stripeCustomer.id);
-
-          if (!paymentMethod) {
-            csvRows.push({
-              customer_email: userEmail,
-              stripe_customer_id: stripeCustomer.id,
-              status: "failed",
-              comment: "No payment method found for customer",
-            });
-            csvRows.forEach((row) => csvStream.write(row));
-            failedCount++;
-            continue;
-          }
-
           const subscriptionData = {
             customer: stripeCustomer.id,
             items: stripePriceInfo,

@@ -287,7 +287,13 @@ async function main() {
 
         migratedCount++;
         console.log(`Migrated ${userEmail}`);
-        console.log(`Migrated ${migratedCount} customers.`);
+        console.log(`Migrated ${migratedCount} customers successfully.`);
+        console.log(`Failed to migrate ${failedCount} customers.`);
+        console.log(
+          `Completed: ${migratedCount + failedCount}/${
+            subscriptions.length
+          } customers.`
+        );
         csvRows.push({
           customer_email: userEmail,
           stripe_customer_id: stripeCustomer.id,

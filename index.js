@@ -17,6 +17,7 @@ const requiredEnvVars = [
   "CREATE_CUSTOMER",
   "REMOVE_AND_REDO_SUBSCRIPTIONS",
   "CREATE_COUPONS",
+  "SKIP_SUBSCRIPTIONS_DUE_TODAY",
 ];
 
 let couponsCache = [];
@@ -132,6 +133,10 @@ async function main() {
 
     const csvRows = [];
 
+    console.log(
+      `Preparing to migration up to ${subscriptions.length} customers.`
+    );
+
     for (const subscription of subscriptions) {
       try {
         const userEmail = await getUserEmail(connection, subscription.user_id);
@@ -222,6 +227,7 @@ async function main() {
           console.warn(
             `Subscription ${subscription.ID} renews today! The user may be charged twice.`
           );
+          if (process.env.SKIP_SUBSCRIPTIONS_DUE_TODAY === "true") continue;
         }
 
         const wooCommerceCoupons = await getCouponsForSubscription(
@@ -402,13 +408,15 @@ async function findStripeCouponByCode(code) {
   return coupon || null;
 }
 
+let refreshCouponCache = false;
+
 async function createStripeCoupons(wooCommerceCoupons, subscriptionID) {
   // You'll need to provide more details about how to map WooCommerce coupon stats to Stripe's
   // Assuming a basic coupon for a fixed amount:
 
   const stripeCoupons = [];
 
-  couponsCache = await stripe.coupons.list();
+  if (refreshCouponCache) couponsCache = await stripe.coupons.list();
 
   for (const wooCoupon of wooCommerceCoupons) {
     const existingCoupon = await findStripeCouponByCode(
@@ -431,8 +439,9 @@ async function createStripeCoupons(wooCommerceCoupons, subscriptionID) {
       duration: "forever", // This might be different based on your use case
       id: `${wooCoupon.code}-${subscriptionID}`,
       name: `${wooCoupon.name || wooCoupon.code}-${subscriptionID}`,
-      // ... add other parameters as required
     });
+
+    refreshCouponCache = true;
 
     stripeCoupons.push(coupon.id);
   }

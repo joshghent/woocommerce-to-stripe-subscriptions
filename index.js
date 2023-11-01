@@ -514,10 +514,13 @@ WHERE
     for (const product of results) {
       const productActualPrice = await fetchProductPriceForCurrency(
         connection,
-        product.productVariationID
+        Number(product.productVariationID) <= 0
+          ? product.productID
+          : product.productVariationID,
+        product.currency
       );
 
-      if (process.env.DEBUG === "true")
+      if (process.env.DEBUG === "true" && !productActualPrice)
         console.warn(
           `No price found for product ${product.productName} with currency ${product.currency}. Variation: ${product.productVariationID} Using ${product.productPrice} instead.`
         );
@@ -547,18 +550,30 @@ const fetchProductPriceForCurrency = async (
         WHERE
             post_id = ?
         AND
-            meta_key = 'variable_regular_currency_prices';
+            (meta_key = 'variable_regular_currency_prices' OR meta_key = '_regular_currency_prices')
     `;
 
-  const [rows] = await connection.execute(query, [
-    productVariationID,
-    currencyCode,
-  ]);
+  if (currencyCode === "USD") {
+    query = `SELECT
+            meta_value AS productPrices
+        FROM
+            wp_postmeta
+        WHERE
+            post_id = ?
+        AND
+            meta_key = '_subscription_price'`;
+  }
+
+  const [rows] = await connection.execute(query, [productVariationID]);
+
+  if (process.env.DEBUG === "true") console.log(rows);
 
   // If no price is found for the given currency, return null
   if (rows.length === 0) {
     return null;
   }
+
+  if (currencyCode === "USD") return rows[0].productPrices;
 
   // Otherwise, parse the price from the JSON string
   const productPrices = JSON.parse(rows[0].productPrices);

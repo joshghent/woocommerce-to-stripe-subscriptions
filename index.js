@@ -464,7 +464,9 @@ async function getWooCommerceSubscriptionDetails(subscriptionId, connection) {
     currency_meta.meta_value AS currency,
     customer_user.meta_value AS userID,
     stripe_user.meta_value AS stripeUser,
-    shipping_meta_total.meta_value AS shippingRate
+    shipping_meta_total.meta_value AS shippingRate,
+    item_meta_product.meta_value AS productID,
+    item_meta_variation.meta_value AS productVariationID
 FROM
     wp_posts AS main
 -- Get the overall subscription total
@@ -496,6 +498,8 @@ LEFT JOIN
     wp_woocommerce_order_items AS shipping_items ON main.ID = shipping_items.order_id AND shipping_items.order_item_type = 'shipping'
 LEFT JOIN
     wp_woocommerce_order_itemmeta AS shipping_meta_total ON shipping_items.order_item_id = shipping_meta_total.order_item_id AND shipping_meta_total.meta_key = 'cost'
+LEFT JOIN
+    wp_woocommerce_order_itemmeta AS item_meta_variation ON order_items.order_item_id = item_meta_variation.order_item_id AND item_meta_variation.meta_key = '_variation_id'
 WHERE
     main.ID = ? AND main.post_type = 'shop_subscription';
     `,
@@ -508,8 +512,18 @@ WHERE
 
   if (results && results.length > 0) {
     for (const product of results) {
+      const productActualPrice = await fetchProductPriceForCurrency(
+        connection,
+        product.productVariationID
+      );
+
+      if (process.env.DEBUG === "true")
+        console.warn(
+          `No price found for product ${product.productName} with currency ${product.currency}. Variation: ${product.productVariationID} Using ${product.productPrice} instead.`
+        );
       products.push({
-        priceAmount: product.productPrice,
+        pricePaidByCustomer: product.productPrice,
+        priceAmount: productActualPrice || product.productPrice,
         currency: product.currency,
         productName: product.productName,
         shipping: product.shippingRate,
@@ -519,6 +533,39 @@ WHERE
   if (process.env.DEBUG === "true") console.log(products);
   return products;
 }
+
+const fetchProductPriceForCurrency = async (
+  connection,
+  productVariationID,
+  currencyCode
+) => {
+  let query = `
+        SELECT
+            meta_value AS productPrices
+        FROM
+            wp_postmeta
+        WHERE
+            post_id = ?
+        AND
+            meta_key = 'variable_regular_currency_prices';
+    `;
+
+  const [rows] = await connection.execute(query, [
+    productVariationID,
+    currencyCode,
+  ]);
+
+  // If no price is found for the given currency, return null
+  if (rows.length === 0) {
+    return null;
+  }
+
+  // Otherwise, parse the price from the JSON string
+  const productPrices = JSON.parse(rows[0].productPrices);
+
+  // Return the price for the given currency
+  return productPrices[currencyCode];
+};
 
 async function hasActiveStripeSubscription(customerId) {
   const subscriptions = await stripe.subscriptions.list({

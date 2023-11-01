@@ -35,6 +35,7 @@ const getDateTimeString = () => {
 };
 
 const filename = `./migrations/${getDateTimeString()}-customer-migrations.csv`;
+const filenameFailed = `./migrations/${getDateTimeString()}-customer-migrations-failed.csv`;
 
 function validateEnvironmentVariables() {
   const missingVars = requiredEnvVars.filter(
@@ -96,8 +97,11 @@ async function main() {
 
   const writeStream = await fs.createWriteStream(filename);
   const csvStream = csv.format({ headers: true });
+  const writeStreamFailed = await fs.createWriteStream(filenameFailed);
+  const csvStreamFailed = csv.format({ headers: true });
 
   csvStream.pipe(writeStream);
+  csvStreamFailed.pipe(writeStreamFailed);
 
   stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
@@ -132,17 +136,21 @@ async function main() {
           `);
 
     const csvRows = [];
+    const csvRowsFailed = [];
 
     console.log(
       `Preparing to migration up to ${subscriptions.length} customers.`
     );
 
+    couponsCache = await getAllStripeCoupons();
+    productsCache = await getAllStripeProducts();
+
     for (const subscription of subscriptions) {
       try {
-        const userEmail = await getUserEmail(connection, subscription.user_id);
         let stripeCustomer = await findStripeCustomerByUserId(
           subscription.user_id
         );
+        const userEmail = await getUserEmail(connection, subscription.user_id);
 
         if (process.env.CREATE_CUSTOMER === "true") {
           if (!stripeCustomer) {
@@ -162,13 +170,13 @@ async function main() {
             console.log(
               `No Stripe customer found for WooCommerce user_id ${subscription.user_id}.`
             );
-            csvRows.push({
+            csvRowsFailed.push({
               customer_email: userEmail,
               stripe_customer_id: null,
               status: "failed",
               comment: "No Stripe customer found for WooCommerce user_id",
             });
-            csvRows.forEach((row) => csvStream.write(row));
+            csvRowsFailed.forEach((row) => csvStreamFailed.write(row));
             continue;
           }
         }
@@ -177,19 +185,25 @@ async function main() {
         const paymentMethod = await getValidPaymentMethods(stripeCustomer.id);
 
         if (!paymentMethod) {
-          csvRows.push({
+          csvRowsFailed.push({
             customer_email: userEmail,
             stripe_customer_id: stripeCustomer.id,
             status: "failed",
             comment: "No payment method found for customer",
           });
-          csvRows.forEach((row) => csvStream.write(row));
+          csvRowsFailed.forEach((row) => csvStreamFailed.write(row));
           failedCount++;
           continue;
         }
 
+        const priceIds = await getPriceIdsForSubscription(
+          subscription.ID,
+          connection
+        );
+
         const alreadyHasSubscription = await hasActiveStripeSubscription(
-          stripeCustomer.id
+          stripeCustomer.id,
+          priceIds
         );
         if (alreadyHasSubscription) {
           console.log(
@@ -205,11 +219,6 @@ async function main() {
             console.log(`DRY RUN: Would have deleted the users subscription.`);
           }
         }
-
-        const priceIds = await getPriceIdsForSubscription(
-          subscription.ID,
-          connection
-        );
 
         const stripePriceInfo = priceIds.map((priceId) => {
           return {
@@ -227,7 +236,17 @@ async function main() {
           console.warn(
             `Subscription ${subscription.ID} renews today! The user may be charged twice.`
           );
-          if (process.env.SKIP_SUBSCRIPTIONS_DUE_TODAY === "true") continue;
+          if (process.env.SKIP_SUBSCRIPTIONS_DUE_TODAY === "true") {
+            csvRowsFailed.push({
+              customer_email: userEmail,
+              stripe_customer_id: stripeCustomer.id,
+              status: "failed",
+              comment: "Subscription due today so skipped",
+            });
+            csvRowsFailed.forEach((row) => csvStreamFailed.write(row));
+            failedCount++;
+            continue;
+          }
         }
 
         const wooCommerceCoupons = await getCouponsForSubscription(
@@ -262,10 +281,10 @@ async function main() {
           const subscriptionData = {
             customer: stripeCustomer.id,
             items: stripePriceInfo,
-            // Convert the next payment date to a Unix timestamp
-            billing_cycle_anchor:
-              new Date(subscription.next_payment_date).getTime() / 1000,
             default_payment_method: paymentMethod,
+            proration_behavior: "none",
+            trial_end:
+              new Date(subscription.next_payment_date).getTime() / 1000,
           };
 
           if (stripeCouponIds.length > 0) {
@@ -277,7 +296,7 @@ async function main() {
           );
 
           console.log(
-            `Created Stripe subscription ${stripeSubscription.id} for WooCommerce subscription ${subscription.ID}.`
+            `Created Stripe subscription ${stripeSubscription.id} for WooCommerce subscription ${subscription.ID}. Stripe Customer ID: ${stripeCustomer.id}`
           );
         } else {
           console.log(
@@ -330,16 +349,46 @@ async function findStripeCustomerByUserId(userId) {
   return customers.data[0] || null;
 }
 
+let productsCache = [];
+let productCacheNeedsUpdate = false;
+
+async function getAllStripeProducts() {
+  let allProducts = [];
+  let lastProduct;
+
+  while (true) {
+    const products = await stripe.products.list({
+      limit: 100, // Maximum allowed per API call
+      starting_after: lastProduct ? lastProduct.id : undefined,
+    });
+
+    if (products.data.length === 0) {
+      break;
+    }
+
+    allProducts = [...allProducts, ...products.data];
+    lastProduct = products.data[products.data.length - 1];
+  }
+
+  return allProducts;
+}
+
+async function fetchProductsOrCache() {
+  if (productCacheNeedsUpdate) {
+    productsCache = await getAllStripeProducts();
+    productCacheNeedsUpdate = false;
+  }
+
+  return productsCache;
+}
+
 async function getPriceByProductName(productName) {
   try {
     // 1. Fetch products by name
-    const products = await stripe.products.list({
-      limit: 10, // You can adjust the limit as needed
-      active: true,
-    });
+    productsCache = await fetchProductsOrCache();
 
     // Find product with the given name
-    const product = products.data.find((p) => p.name === productName);
+    const product = productsCache.find((p) => p.name === productName);
 
     if (!product) {
       if (process.env.DEBUG === "true")
@@ -399,11 +448,42 @@ WHERE
   });
 }
 
-async function findStripeCouponByCode(code) {
-  if (couponsCache.length === 0) {
-    couponsCache = await stripe.coupons.list();
+async function getAllStripeCoupons() {
+  let allCoupons = [];
+  let lastCouponId;
+
+  while (true) {
+    let params = { limit: 100 }; // 100 is the max limit per call
+
+    if (lastCouponId) {
+      params.starting_after = lastCouponId;
+    }
+
+    const coupons = await stripe.coupons.list(params);
+
+    allCoupons = allCoupons.concat(coupons.data);
+
+    if (coupons.data.length === 100) {
+      lastCouponId = coupons.data[coupons.data.length - 1].id;
+    } else {
+      break;
+    }
   }
-  const coupon = couponsCache.data.find((c) => c.name === code);
+
+  return allCoupons;
+}
+
+async function findStripeCouponByCode(code, currency, value) {
+  if (couponsCache.length === 0) {
+    couponsCache = await getAllStripeCoupons();
+  }
+
+  const coupon = couponsCache.find(
+    (c) =>
+      c.name === code &&
+      c.currency === currency.toLowerCase() &&
+      c.amount_off === value
+  );
 
   return coupon || null;
 }
@@ -416,11 +496,13 @@ async function createStripeCoupons(wooCommerceCoupons, subscriptionID) {
 
   const stripeCoupons = [];
 
-  if (refreshCouponCache) couponsCache = await stripe.coupons.list();
+  if (refreshCouponCache) couponsCache = await getAllStripeCoupons();
 
   for (const wooCoupon of wooCommerceCoupons) {
     const existingCoupon = await findStripeCouponByCode(
-      wooCoupon.name || wooCoupon.code
+      `${wooCoupon.name || wooCoupon.code}-${subscriptionID}`,
+      wooCoupon.currency,
+      Math.round(wooCoupon.amount * 100)
     );
 
     if (existingCoupon) {
@@ -441,7 +523,7 @@ async function createStripeCoupons(wooCommerceCoupons, subscriptionID) {
       name: `${wooCoupon.name || wooCoupon.code}-${subscriptionID}`,
     });
 
-    refreshCouponCache = true;
+    couponsCache.push(coupon.data);
 
     stripeCoupons.push(coupon.id);
   }
@@ -470,11 +552,49 @@ async function getPriceIdsForSubscription(subscriptionId, connection) {
     // Look for a matching price in Stripe using the product name
     const price = await getPriceByProductName(productName);
 
+    if (process.env.DEBUG === "true") {
+      console.log(`DEBUG: Price for ${productName}: ${JSON.stringify(price)}`);
+      console.log(`DEBUG: Comparing to ${priceAmount} ${currency}`);
+    }
+
+    // If the product has a shipping rate, create a new price for it.
+    // But only create it once for each subscription
+    // Create the shipping first because we need to check if the price exists in stripe afterward
+    if (shipping && shippingCreated === false) {
+      // Check if the shipping price exists
+      if (
+        price &&
+        price.length > 0 &&
+        price[0].currency.toLowerCase() === currency.toLowerCase() &&
+        price[0].unit_amount === Math.round(shipping * 100)
+      ) {
+        // If a price exists, use the first one.
+        priceIds.push(price[0].id);
+      } else {
+        const shippingPrice = await stripe.prices.create({
+          unit_amount: Math.round(shipping * 100), // amount in cents
+          currency: currency,
+          recurring: { interval: "year" }, // Subscriptions are always yearly
+          product_data: {
+            name: `${productName} shipping`,
+            metadata: {
+              woocommerce_price: Math.round(shipping * 100),
+              woocommerce_currency: currency,
+              type: "shipping",
+            },
+          },
+        });
+
+        priceIds.push(shippingPrice.id);
+      }
+      shippingCreated = true;
+    }
+
     if (
       price &&
       price.length > 0 &&
-      price[0].currenty === currency &&
-      price[0].unit_amount === priceAmount
+      price[0].currency.toLowerCase() === currency.toLowerCase() &&
+      price[0].unit_amount === Math.round(priceAmount * 100)
     ) {
       // If a price exists, use the first one.
       priceIds.push(price[0].id);
@@ -499,26 +619,7 @@ async function getPriceIdsForSubscription(subscriptionId, connection) {
         },
       });
       priceIds.push(newPrice.id);
-
-      // If the product has a shipping rate, create a new price for it.
-      // But only create it once for each subscription
-      if (shipping && shippingCreated === false) {
-        const shippingPrice = await stripe.prices.create({
-          unit_amount: Math.round(shipping * 100), // amount in cents
-          currency: currency,
-          recurring: { interval: "year" }, // Subscriptions are always yearly
-          product_data: {
-            name: `${productName} shipping`,
-            metadata: {
-              woocommerce_price: Math.round(shipping * 100),
-              woocommerce_currency: currency,
-              type: "shipping",
-            },
-          },
-        });
-        priceIds.push(shippingPrice.id);
-        shippingCreated = true;
-      }
+      productsCache.push(newPrice.data);
     } else {
       console.log(
         `DRY_RUN: Would create a new price for product ${productName}.`
@@ -660,14 +761,29 @@ const fetchProductPriceForCurrency = async (
   return productPrices[currencyCode];
 };
 
-async function hasActiveStripeSubscription(customerId) {
-  const subscriptions = await stripe.subscriptions.list({
-    customer: customerId,
-    status: "active",
-    limit: 1,
-  });
+async function hasActiveStripeSubscription(customerId, priceIds) {
+  try {
+    const subscriptions = await stripe.subscriptions.list({
+      customer: customerId,
+      status: "active",
+      expand: ["data.items.data.price"],
+    });
 
-  return subscriptions.data.length > 0;
+    // Filtering active subscriptions that have items with the given priceIds
+    const matchingSubscription = subscriptions.data.find((subscription) => {
+      const subscriptionPriceIds = subscription.items.data.map(
+        (item) => item.price.id
+      );
+      return priceIds.every((priceId) =>
+        subscriptionPriceIds.includes(priceId)
+      );
+    });
+
+    return matchingSubscription;
+  } catch (error) {
+    console.error("Error fetching subscriptions:", error);
+    throw error;
+  }
 }
 
 async function getUserEmail(connection, user_id) {

@@ -57,7 +57,7 @@ async function getValidPaymentMethods(customerId) {
     });
 
     const currentYear = new Date().getFullYear();
-    const currentMonth = new Date().getMonth() + 1; // JavaScript months are 0-indexed
+    const currentMonth = new Date().getMonth() + 1;
 
     const validMethods = paymentMethods.data.filter((method) => {
       // Check if the card's expiration year is in the future OR
@@ -218,6 +218,11 @@ async function main() {
           } else {
             console.log(`DRY RUN: Would have deleted the users subscription.`);
           }
+        } else {
+          if (process.env.DEBUG === "true")
+            console.log(
+              `DEBUG: Stripe customer ${stripeCustomer.id} does not have an active subscription.`
+            );
         }
 
         const stripePriceInfo = priceIds.map((priceId) => {
@@ -491,9 +496,6 @@ async function findStripeCouponByCode(code, currency, value) {
 let refreshCouponCache = false;
 
 async function createStripeCoupons(wooCommerceCoupons, subscriptionID) {
-  // You'll need to provide more details about how to map WooCommerce coupon stats to Stripe's
-  // Assuming a basic coupon for a fixed amount:
-
   const stripeCoupons = [];
 
   if (refreshCouponCache) couponsCache = await getAllStripeCoupons();
@@ -545,33 +547,26 @@ async function getPriceIdsForSubscription(subscriptionId, connection) {
 
   const priceIds = [];
 
-  let shippingCreated = false;
-
+  // Handle shipping first
   for (const product of products) {
-    const { priceAmount, currency, productName, shipping } = product;
-    // Look for a matching price in Stripe using the product name
-    const price = await getPriceByProductName(productName);
+    const { currency, productName, shipping } = product;
 
-    if (process.env.DEBUG === "true") {
-      console.log(`DEBUG: Price for ${productName}: ${JSON.stringify(price)}`);
-      console.log(`DEBUG: Comparing to ${priceAmount} ${currency}`);
-    }
+    // If the product has a shipping rate and it's not created yet, create a new price for it.
+    if (shipping) {
+      const shippingPriceInStripe = await getPriceByProductName(
+        `${productName} shipping`
+      );
 
-    // If the product has a shipping rate, create a new price for it.
-    // But only create it once for each subscription
-    // Create the shipping first because we need to check if the price exists in stripe afterward
-    if (shipping && shippingCreated === false) {
-      // Check if the shipping price exists
       if (
-        price &&
-        price.length > 0 &&
-        price[0].currency.toLowerCase() === currency.toLowerCase() &&
-        price[0].unit_amount === Math.round(shipping * 100)
+        shippingPriceInStripe &&
+        shippingPriceInStripe.length > 0 &&
+        shippingPriceInStripe[0].currency.toLowerCase() ===
+          currency.toLowerCase() &&
+        shippingPriceInStripe[0].unit_amount === Math.round(shipping * 100)
       ) {
-        // If a price exists, use the first one.
-        priceIds.push(price[0].id);
+        priceIds.push(shippingPriceInStripe[0].id);
       } else {
-        const shippingPrice = await stripe.prices.create({
+        const newShippingPrice = await stripe.prices.create({
           unit_amount: Math.round(shipping * 100), // amount in cents
           currency: currency,
           recurring: { interval: "year" }, // Subscriptions are always yearly
@@ -584,20 +579,25 @@ async function getPriceIdsForSubscription(subscriptionId, connection) {
             },
           },
         });
-
-        priceIds.push(shippingPrice.id);
+        priceIds.push(newShippingPrice.id);
       }
-      shippingCreated = true;
+      break; // Break out of the loop as we've handled shipping
     }
+  }
+
+  // Now handle products
+  for (const product of products) {
+    const { priceAmount, currency, productName } = product;
+
+    const existingPrice = await getPriceByProductName(productName);
 
     if (
-      price &&
-      price.length > 0 &&
-      price[0].currency.toLowerCase() === currency.toLowerCase() &&
-      price[0].unit_amount === Math.round(priceAmount * 100)
+      existingPrice &&
+      existingPrice.length > 0 &&
+      existingPrice[0].currency.toLowerCase() === currency.toLowerCase() &&
+      existingPrice[0].unit_amount === Math.round(priceAmount * 100)
     ) {
-      // If a price exists, use the first one.
-      priceIds.push(price[0].id);
+      priceIds.push(existingPrice[0].id);
       continue;
     }
 
@@ -605,7 +605,6 @@ async function getPriceIdsForSubscription(subscriptionId, connection) {
       process.env.DRY_RUN !== "true" &&
       process.env.CREATE_PRODUCTS === "true"
     ) {
-      // If the price doesn't exist in Stripe, create one using the product name.
       const newPrice = await stripe.prices.create({
         unit_amount: Math.round(priceAmount * 100), // amount in cents
         currency: currency,

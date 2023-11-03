@@ -150,6 +150,7 @@ async function main() {
         let stripeCustomer = await findStripeCustomerByUserId(
           subscription.user_id
         );
+
         const userEmail = await getUserEmail(connection, subscription.user_id);
 
         if (process.env.CREATE_CUSTOMER === "true") {
@@ -218,6 +219,16 @@ async function main() {
           } else {
             console.log(`DRY RUN: Would have deleted the users subscription.`);
           }
+
+          csvRowsFailed.push({
+            customer_email: userEmail,
+            stripe_customer_id: stripeCustomer.id,
+            status: "failed",
+            comment: "Subscription for these items already exists",
+          });
+          csvRowsFailed.forEach((row) => csvStreamFailed.write(row));
+          failedCount++;
+          continue;
         } else {
           if (process.env.DEBUG === "true")
             console.log(
@@ -375,11 +386,11 @@ async function getAllStripeProducts() {
     lastProduct = products.data[products.data.length - 1];
   }
 
-  return allProducts;
+  return allProducts.filter((p) => p);
 }
 
 async function fetchProductsOrCache() {
-  if (productCacheNeedsUpdate) {
+  if (productCacheNeedsUpdate || productsCache.length === 0) {
     productsCache = await getAllStripeProducts();
     productCacheNeedsUpdate = false;
   }
@@ -387,31 +398,51 @@ async function fetchProductsOrCache() {
   return productsCache;
 }
 
-async function getPriceByProductName(productName) {
+async function getPriceByProductName(productName, price, currency) {
   try {
     // 1. Fetch products by name
     productsCache = await fetchProductsOrCache();
 
     // Find product with the given name
-    const product = productsCache.find((p) => p.name === productName);
+    let product = productsCache.filter((p) => {
+      return (
+        p.name.toLowerCase() === productName.trim() &&
+        p.metadata.woocommerce_price === price &&
+        p.metadata.woocommerce_currency.toLowerCase() === currency.toLowerCase()
+      );
+    });
+
+    // TODO: Because of bad data there is probably multiple products with valid pricing
+    // This means that when we try to grab pricing that matches any existing subscriptions
+    // It won't match correctly
+    // Update this code so it returns multiple products pricing if it exists
+    if (product.length > 0) product = product[0];
 
     if (!product) {
       if (process.env.DEBUG === "true")
-        console.log(`Product with name ${productName} not found.`);
+        console.log(`DEBUG: Product with name ${productName} not found.`);
       return;
     }
 
     // 2. Fetch prices for the found product
-    const prices = await stripe.prices.list({
+    let prices = await stripe.prices.list({
       product: product.id,
       active: true,
+      currency: currency.toLowerCase(),
     });
+
+    prices.data = prices.data.filter(
+      (price) => price.unit_amount === price && price.currency === currency
+    );
 
     // Print all the active prices for the product
     if (process.env.DEBUG === "true") {
+      console.log(
+        `DEBUG: Prices for product ${productName} ${price} ${currency.toLowerCase()}:`
+      );
       prices.data.forEach((price) => {
         console.log(
-          `Price ID: ${price.id}, Amount: ${price.unit_amount}, Currency: ${price.currency}`
+          `DEBUG: Price ID: ${price.id}, Amount: ${price.unit_amount}, Currency: ${price.currency}`
         );
       });
     }
@@ -546,51 +577,67 @@ async function getPriceIdsForSubscription(subscriptionId, connection) {
   }
 
   const priceIds = [];
+  let combinedShipping = 0;
 
-  // Handle shipping first
+  // First, sum up the shipping costs across all products
   for (const product of products) {
-    const { currency, productName, shipping } = product;
-
-    // If the product has a shipping rate and it's not created yet, create a new price for it.
+    const { priceAmount, currency, productName, shipping } = product;
     if (shipping) {
-      const shippingPriceInStripe = await getPriceByProductName(
-        `${productName} shipping`
-      );
-
-      if (
-        shippingPriceInStripe &&
-        shippingPriceInStripe.length > 0 &&
-        shippingPriceInStripe[0].currency.toLowerCase() ===
-          currency.toLowerCase() &&
-        shippingPriceInStripe[0].unit_amount === Math.round(shipping * 100)
-      ) {
-        priceIds.push(shippingPriceInStripe[0].id);
-      } else {
-        const newShippingPrice = await stripe.prices.create({
-          unit_amount: Math.round(shipping * 100), // amount in cents
-          currency: currency,
-          recurring: { interval: "year" }, // Subscriptions are always yearly
-          product_data: {
-            name: `${productName} shipping`,
-            metadata: {
-              woocommerce_price: Math.round(shipping * 100),
-              woocommerce_currency: currency,
-              type: "shipping",
-            },
-          },
-        });
-        priceIds.push(newShippingPrice.id);
-      }
-      break; // Break out of the loop as we've handled shipping
+      combinedShipping += shipping;
     }
   }
 
-  // Now handle products
+  // Now, handle the combined shipping
+  if (combinedShipping > 0) {
+    const shippingPriceInStripe = await getPriceByProductName(
+      `Shipping Costs`,
+      Math.round(combinedShipping * 100),
+      products[0].currency // All products should have the same currency
+    );
+
+    if (process.env.DEBUG === "true")
+      console.log(
+        `DEBUG: Shipping price in Stripe: ${JSON.stringify(
+          shippingPriceInStripe
+        )}`
+      );
+
+    if (
+      shippingPriceInStripe &&
+      shippingPriceInStripe.length > 0 &&
+      shippingPriceInStripe[0].unit_amount ===
+        Math.round(combinedShipping * 100)
+    ) {
+      priceIds.push(shippingPriceInStripe[0].id);
+    } else {
+      const newShippingPrice = await stripe.prices.create({
+        unit_amount: Math.round(combinedShipping * 100),
+        currency: products[0].currency,
+        recurring: { interval: "year" },
+        product_data: {
+          name: "Shipping Costs",
+          metadata: {
+            woocommerce_price: Math.round(combinedShipping * 100),
+            woocommerce_currency: products[0].currency,
+            type: "shipping",
+          },
+        },
+      });
+      priceIds.push(newShippingPrice.id);
+    }
+  }
+
+  // Handle products
   for (const product of products) {
     const { priceAmount, currency, productName } = product;
 
-    const existingPrice = await getPriceByProductName(productName);
+    const existingPrice = await getPriceByProductName(
+      productName,
+      Math.round(priceAmount * 100),
+      currency
+    );
 
+    // TODO: Update this to loop through all the prices and check if any of them match
     if (
       existingPrice &&
       existingPrice.length > 0 &&
@@ -598,17 +645,14 @@ async function getPriceIdsForSubscription(subscriptionId, connection) {
       existingPrice[0].unit_amount === Math.round(priceAmount * 100)
     ) {
       priceIds.push(existingPrice[0].id);
-      continue;
-    }
-
-    if (
+    } else if (
       process.env.DRY_RUN !== "true" &&
       process.env.CREATE_PRODUCTS === "true"
     ) {
       const newPrice = await stripe.prices.create({
-        unit_amount: Math.round(priceAmount * 100), // amount in cents
+        unit_amount: Math.round(priceAmount * 100),
         currency: currency,
-        recurring: { interval: "year" }, // Subscriptions are always yearly
+        recurring: { interval: "year" },
         product_data: {
           name: productName,
           metadata: {
@@ -764,9 +808,17 @@ async function hasActiveStripeSubscription(customerId, priceIds) {
   try {
     const subscriptions = await stripe.subscriptions.list({
       customer: customerId,
-      status: "active",
+      status: "trialing",
       expand: ["data.items.data.price"],
     });
+
+    if (process.env.DEBUG === "true") {
+      console.log(
+        `DEBUG: Got subscriptions for customer ${customerId} - ${JSON.stringify(
+          subscriptions
+        )}}`
+      );
+    }
 
     // Filtering active subscriptions that have items with the given priceIds
     const matchingSubscription = subscriptions.data.find((subscription) => {

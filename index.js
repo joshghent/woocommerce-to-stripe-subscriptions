@@ -386,7 +386,7 @@ async function getAllStripeProducts() {
     lastProduct = products.data[products.data.length - 1];
   }
 
-  return allProducts.filter((p) => p);
+  return allProducts.filter((p) => p && typeof p.name === "string");
 }
 
 async function fetchProductsOrCache() {
@@ -404,43 +404,45 @@ async function getPriceByProductName(productName, price, currency) {
     productsCache = await fetchProductsOrCache();
 
     // Find product with the given name
-    let product = productsCache.filter((p) => {
+    let productMatches = productsCache.filter((p) => {
       return (
-        p.name.toLowerCase() === productName.trim() &&
-        p.metadata.woocommerce_price === price &&
+        p.name.toLowerCase() === productName.trim().toLowerCase() &&
+        p.metadata.woocommerce_price === price.toString() &&
         p.metadata.woocommerce_currency.toLowerCase() === currency.toLowerCase()
       );
     });
 
-    // TODO: Because of bad data there is probably multiple products with valid pricing
-    // This means that when we try to grab pricing that matches any existing subscriptions
-    // It won't match correctly
-    // Update this code so it returns multiple products pricing if it exists
-    if (product.length > 0) product = product[0];
-
-    if (!product) {
+    // Since we may have multiple products with valid pricing, return all matching products
+    if (productMatches.length === 0) {
       if (process.env.DEBUG === "true")
         console.log(`DEBUG: Product with name ${productName} not found.`);
-      return;
+      return [];
     }
 
-    // 2. Fetch prices for the found product
-    let prices = await stripe.prices.list({
-      product: product.id,
-      active: true,
-      currency: currency.toLowerCase(),
-    });
+    let allPrices = [];
+    for (const product of productMatches) {
+      // Fetch prices for the found product
+      let prices = await stripe.prices.list({
+        product: product.id,
+        active: true,
+        currency: currency.toLowerCase(),
+      });
 
-    prices.data = prices.data.filter(
-      (price) => price.unit_amount === price && price.currency === currency
-    );
+      let matchingPrices = prices.data.filter(
+        (priceEntry) =>
+          priceEntry.unit_amount === parseInt(price) &&
+          priceEntry.currency.toLowerCase() === currency.toLowerCase()
+      );
+
+      allPrices = [...allPrices, ...matchingPrices];
+    }
 
     // Print all the active prices for the product
     if (process.env.DEBUG === "true") {
       console.log(
         `DEBUG: Prices for product ${productName} ${price} ${currency.toLowerCase()}:`
       );
-      prices.data.forEach((price) => {
+      allPrices.forEach((price) => {
         console.log(
           `DEBUG: Price ID: ${price.id}, Amount: ${price.unit_amount}, Currency: ${price.currency}`
         );
@@ -448,7 +450,7 @@ async function getPriceByProductName(productName, price, currency) {
     }
 
     // Return the list of prices (you can adjust as needed)
-    return prices.data;
+    return allPrices;
   } catch (error) {
     console.error("An error occurred:", error);
   }
@@ -629,22 +631,23 @@ async function getPriceIdsForSubscription(subscriptionId, connection) {
 
   // Handle products
   for (const product of products) {
-    const { priceAmount, currency, productName } = product;
+    const { priceAmount, currency, productName, productId } = product;
 
-    const existingPrice = await getPriceByProductName(
+    const existingPrices = await getPriceByProductName(
       productName,
       Math.round(priceAmount * 100),
       currency
     );
 
-    // TODO: Update this to loop through all the prices and check if any of them match
-    if (
-      existingPrice &&
-      existingPrice.length > 0 &&
-      existingPrice[0].currency.toLowerCase() === currency.toLowerCase() &&
-      existingPrice[0].unit_amount === Math.round(priceAmount * 100)
-    ) {
-      priceIds.push(existingPrice[0].id);
+    let priceMatch = existingPrices.find(
+      (price) =>
+        price.currency.toLowerCase() === currency.toLowerCase() &&
+        price.unit_amount === Math.round(priceAmount * 100) &&
+        price.metadata.woocommerce_product_id === productId.toString()
+    );
+
+    if (priceMatch) {
+      priceIds.push(priceMatch.id);
     } else if (
       process.env.DRY_RUN !== "true" &&
       process.env.CREATE_PRODUCTS === "true"
@@ -658,6 +661,7 @@ async function getPriceIdsForSubscription(subscriptionId, connection) {
           metadata: {
             woocommerce_price: Math.round(priceAmount * 100),
             woocommerce_currency: currency,
+            woocommerce_product_id: productId.toString(),
           },
         },
       });
@@ -752,6 +756,7 @@ WHERE
         currency: product.currency,
         productName: product.productName,
         shipping: product.shippingRate,
+        productId: product.productVariationID ?? product.productID,
       });
     }
   }
